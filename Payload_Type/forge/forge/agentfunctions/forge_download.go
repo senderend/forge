@@ -3,7 +3,6 @@ package agentfunctions
 import (
 	"archive/tar"
 	"compress/gzip"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -731,9 +730,11 @@ type bofCommandDefinitionArguments struct {
 	Name        string `json:"name"`
 	Description string `json:"desc"`
 	//Type valid values: b -> file, i -> int or integer, s -> short, z -> string, Z -> wstring
-	Type     string      `json:"type"`
-	Optional bool        `json:"optional"`
-	Default  interface{} `json:"default"`
+	Type          string             `json:"type"`
+	Optional      bool               `json:"optional"`
+	InputOptional *bool              `json:"input_optional,omitempty"`
+	Default       interface{}        `json:"default"`
+	Choices       bofArgumentChoices `json:"choices,omitempty"`
 }
 type bofCommandDefinition struct {
 	Name            string                          `json:"name"`
@@ -762,7 +763,7 @@ func loadBofCommandDefinitions(commandSource collectionSourceCommandData, collec
 	bofCommandExtension := bofCommandDefinition{}
 	err = json.Unmarshal(bofCommandExtensionFile, &bofCommandExtension)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("manifest %s: %w", bofCommandExtensionFilePath, err)
 	}
 	commandDefinitions := expandBofCommandDefinitions(bofCommandExtension)
 	if len(commandDefinitions) == 0 {
@@ -878,51 +879,36 @@ func getBofCommandNamesForRemoval(commandSource collectionSourceCommandData, col
 	return commandNames
 }
 
-func buildBofCommand(commandSource collectionSourceCommandData, collectionSourceData collectionSource, bofCommandExtension bofCommandDefinition) agentstructs.Command {
-	newCommandParameters := []agentstructs.CommandParameter{}
-	for i, arg := range bofCommandExtension.Arguments {
-		newType := agentstructs.COMMAND_PARAMETER_TYPE_STRING
-		switch arg.Type {
-		case "file":
-			fallthrough
-		case "b":
-			newType = agentstructs.COMMAND_PARAMETER_TYPE_FILE
-		case "int":
-			fallthrough
-		case "integer":
-			fallthrough
-		case "i":
-			fallthrough
-		case "short":
-			fallthrough
-		case "s":
-			newType = agentstructs.COMMAND_PARAMETER_TYPE_NUMBER
-		case "string":
-			fallthrough
-		case "z":
-			fallthrough
-		case "wstring":
-			fallthrough
-		case "Z":
-			newType = agentstructs.COMMAND_PARAMETER_TYPE_STRING
-		}
-		newArg := agentstructs.CommandParameter{
-			Name:          arg.Name,
-			Description:   arg.Description,
-			ParameterType: newType,
-			DefaultValue:  arg.Default,
-			ParameterGroupInformation: []agentstructs.ParameterGroupInfo{
-				{
-					ParameterIsRequired: !arg.Optional,
-					UIModalPosition:     uint32(i),
-				},
-			},
-		}
-		newCommandParameters = append(newCommandParameters, newArg)
+func buildBofCommand(commandSource collectionSourceCommandData, collectionSourceData collectionSource, bofCommandExtension bofCommandDefinition) (agentstructs.Command, error) {
+	compiledArguments, err := compileBofArguments(bofCommandExtension)
+	if err != nil {
+		return agentstructs.Command{}, fmt.Errorf("collection %q manifest %q/extension.json: %w", collectionSourceData.Name, commandSource.CommandName, err)
+	}
+	newCommandParameters := make([]agentstructs.CommandParameter, len(compiledArguments))
+	for i, arg := range compiledArguments {
+		newCommandParameters[i] = arg.parameter
 	}
 	helpString := bofCommandExtension.LongHelp
 	if helpString == "" {
 		helpString = bofCommandExtension.Help
+	}
+	parseString := func(args *agentstructs.PTTaskMessageArgsData, input string) error {
+		if strings.TrimSpace(input) == "" {
+			return nil
+		}
+		var values map[string]interface{}
+		decoder := json.NewDecoder(strings.NewReader(input))
+		decoder.UseNumber()
+		if err := decoder.Decode(&values); err != nil {
+			return fmt.Errorf("command %q: invalid argument JSON: %w", bofCommandExtension.CommandName, err)
+		}
+		if values == nil {
+			return fmt.Errorf("command %q: expected an argument object", bofCommandExtension.CommandName)
+		}
+		if err := decoder.Decode(new(interface{})); err != io.EOF {
+			return fmt.Errorf("command %q: unexpected trailing argument JSON", bofCommandExtension.CommandName)
+		}
+		return loadBofInput(compiledArguments, args, values)
 	}
 	return agentstructs.Command{
 		Name: fmt.Sprintf("%s%s", BofPrefix, bofCommandExtension.CommandName),
@@ -945,89 +931,23 @@ func buildBofCommand(commandSource collectionSourceCommandData, collectionSource
 				TaskID:  taskData.Task.ID,
 			}
 			binaryFileID := ""
-			typedArgs := make([][]interface{}, len(bofCommandExtension.Arguments))
-			displayParams := ""
-			for i, arg := range bofCommandExtension.Arguments {
-				switch arg.Type {
-				case "file":
-					fallthrough
-				case "b":
-					fileId, err := taskData.Args.GetFileArg(arg.Name)
-					if err != nil {
-						logging.LogError(err, "failed to get file type arg")
-						response.Success = false
-						response.Error = err.Error()
-						return response
-					}
-					fileSearchResp, err := mythicrpc.SendMythicRPCFileGetContent(mythicrpc.MythicRPCFileGetContentMessage{
-						AgentFileID: fileId,
-					})
-					if err != nil {
-						logging.LogError(err, "failed to send request to mythic for file")
-						response.Success = false
-						response.Error = err.Error()
-						return response
-					}
-					if !fileSearchResp.Success {
-						logging.LogError(nil, "failed to get file contents from mythic", "err", fileSearchResp.Error)
-						response.Success = false
-						response.Error = fileSearchResp.Error
-						return response
-					}
-					typedArgs[i] = []interface{}{"b", base64.StdEncoding.EncodeToString(fileSearchResp.Content)}
-					displayParams += fmt.Sprintf("-%s %s ", arg.Name, fileId)
-				case "int":
-					fallthrough
-				case "integer":
-					fallthrough
-				case "i":
-					numArg, err := taskData.Args.GetNumberArg(arg.Name)
-					if err != nil {
-						logging.LogError(err, "failed to get i type arg")
-						response.Success = false
-						response.Error = err.Error()
-						return response
-					}
-					typedArgs[i] = []interface{}{"i", int(numArg)}
-					displayParams += fmt.Sprintf("-%s %d ", arg.Name, int(numArg))
-				case "short":
-					fallthrough
-				case "s":
-					numArg, err := taskData.Args.GetNumberArg(arg.Name)
-					if err != nil {
-						logging.LogError(err, "failed to get s type arg")
-						response.Success = false
-						response.Error = err.Error()
-						return response
-					}
-					typedArgs[i] = []interface{}{"s", int(numArg)}
-					displayParams += fmt.Sprintf("-%s %d ", arg.Name, int(numArg))
-				case "string":
-					fallthrough
-				case "z":
-					stringArg, err := taskData.Args.GetStringArg(arg.Name)
-					if err != nil {
-						logging.LogError(err, "failed to get z type arg")
-						response.Success = false
-						response.Error = err.Error()
-						return response
-					}
-					typedArgs[i] = []interface{}{"z", stringArg}
-					displayParams += fmt.Sprintf("-%s %s ", arg.Name, stringArg)
-				case "wstring":
-					fallthrough
-				case "Z":
-					stringArg, err := taskData.Args.GetStringArg(arg.Name)
-					if err != nil {
-						logging.LogError(err, "failed to get Z type arg")
-						response.Success = false
-						response.Error = err.Error()
-						return response
-					}
-					typedArgs[i] = []interface{}{"Z", stringArg}
-					displayParams += fmt.Sprintf("-%s %s ", arg.Name, stringArg)
+			typedArgs, displayParams, err := buildBofTypedArguments(compiledArguments, &taskData.Args, func(fileID string) ([]byte, error) {
+				fileResponse, err := mythicrpc.SendMythicRPCFileGetContent(mythicrpc.MythicRPCFileGetContentMessage{AgentFileID: fileID})
+				if err != nil {
+					return nil, err
 				}
-				taskData.Args.RemoveArg(arg.Name)
+				if !fileResponse.Success {
+					return nil, errors.New(fileResponse.Error)
+				}
+				return fileResponse.Content, nil
+			})
+			if err != nil {
+				response.Success = false
+				response.Error = err.Error()
+				return response
+			}
+			for _, arg := range compiledArguments {
+				taskData.Args.RemoveArg(arg.parameter.Name)
 			}
 			response.DisplayParams = &displayParams
 			targetFilename := ""
@@ -1153,26 +1073,14 @@ func buildBofCommand(commandSource collectionSourceCommandData, collectionSource
 			for _, agent := range registeredAgents {
 				if agent.Agent == taskData.PayloadType {
 					commandName := agent.BofCommand
-					commandFileArg := agent.BofFileParameterName
-					commandArgsArg := agent.BofArgumentArrayParameterName
 					response.CommandName = &commandName
 					response.ReprocessAtNewCommandPayloadType = agent.Agent
 
-					taskData.Args.AddArg(agentstructs.CommandParameter{
-						Name:          commandFileArg,
-						ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_FILE,
-						DefaultValue:  binaryFileID,
-					})
-					taskData.Args.AddArg(agentstructs.CommandParameter{
-						Name:          commandArgsArg,
-						ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_TYPED_ARRAY,
-						DefaultValue:  typedArgs,
-					})
-					taskData.Args.AddArg(agentstructs.CommandParameter{
-						Name:          agent.BofEntryPointParameterName,
-						ParameterType: agentstructs.COMMAND_PARAMETER_TYPE_STRING,
-						DefaultValue:  bofCommandExtension.Entrypoint,
-					})
+					if err := addBofExecutionArguments(&taskData.Args, agent, binaryFileID, bofCommandExtension.Entrypoint, typedArgs); err != nil {
+						response.Success = false
+						response.Error = err.Error()
+						return response
+					}
 					newStdout := fmt.Sprintf("%s final args:\nFile: %s\nTyped Args: %v\nEntrypoint: %s\n",
 						commandName, binaryFileID, typedArgs, bofCommandExtension.Entrypoint)
 					response.Stdout = &newStdout
@@ -1194,15 +1102,15 @@ func buildBofCommand(commandSource collectionSourceCommandData, collectionSource
 			return response
 		},
 		TaskFunctionParseArgDictionary: func(args *agentstructs.PTTaskMessageArgsData, input map[string]interface{}) error {
-			return args.LoadArgsFromDictionary(input)
-		},
-		TaskFunctionParseArgString: func(args *agentstructs.PTTaskMessageArgsData, input string) error {
-			if len(input) > 0 {
-				return args.LoadArgsFromJSONString(input)
+			// The SDK decodes modal JSON into float64 before this hook. Re-read
+			// its original JSON so fractional values cannot round into integers.
+			if strings.TrimSpace(args.GetCommandLine()) != "" {
+				return parseString(args, args.GetCommandLine())
 			}
-			return nil
+			return loadBofInput(compiledArguments, args, input)
 		},
-	}
+		TaskFunctionParseArgString: parseString,
+	}, nil
 }
 
 func addBofCommandsToFile(commandSource collectionSourceCommandData, collectionSourceData collectionSource, commandNames []string) error {
@@ -1261,7 +1169,11 @@ func createBofCommand(commandSource collectionSourceCommandData, collectionSourc
 	}
 	newCommands := make([]agentstructs.Command, 0, len(commandDefinitions))
 	for _, commandDefinition := range commandDefinitions {
-		newCommands = append(newCommands, buildBofCommand(commandSource, collectionSourceData, commandDefinition))
+		command, err := buildBofCommand(commandSource, collectionSourceData, commandDefinition)
+		if err != nil {
+			return err
+		}
+		newCommands = append(newCommands, command)
 	}
 	if addCommandToFile {
 		commandNames := bofCommandNamesFromDefinitions(commandDefinitions, commandSource.CommandName)
